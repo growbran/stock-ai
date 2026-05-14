@@ -1,145 +1,93 @@
 """
-modules/technical_us.py
-미국(US) 스윙 트레이딩 기술적 분석 모듈.
-
-★ 이 파일만 수정하면 됩니다 — app.py, 탭 파일 수정 불필요.
-★ 함수 시그니처(run_technical_analysis)는 유지하고 내부 로직만 교체하세요.
-
-현재: 스윙 트레이딩 기본 지표 뼈대 (모멘텀·RSI·52주 고점)
-추후: 세밀한 스윙 매매 기준으로 교체 예정
+tabs/tab_us.py
+미국(US) 스윙 트레이딩 스크리닝 탭.
+실제 스크리닝 로직은 modules/screener_us.py 에 있다.
+기술적 분석 로직은 modules/technical_us.py 에 분리 — 수정 시 이 파일 무관.
 """
 
-from __future__ import annotations
-import pandas as pd
+import streamlit as st
 
 
-# ── 공개 인터페이스 (시그니처 고정) ─────────────────────────
-def run_technical_analysis(df: pd.DataFrame) -> dict:
-    """
-    OHLCV DataFrame을 받아 스윙 트레이딩 기술적 분석 결과를 반환한다.
+def render():
+    st.subheader("🇺🇸 미국 스윙 트레이딩 — 종목 스크리닝")
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        columns: date, open, high, low, close, volume (일봉 기준)
+    st.info(
+        "**스크리닝 기준**\n"
+        "1. 모멘텀 — 52주 신고가 근접 또는 상승 추세\n"
+        "2. 실적 서프라이즈 — 어닝 비트 또는 가이던스 상향\n"
+        "3. 섹터 강도 — 시장 대비 초과 상승 섹터 내 종목\n"
+        "4. 뉴스 감성 70점 이상 + 수급 증가 추세\n\n"
+        "_보유 기간 기준: 3일~3주 스윙_",
+        icon="📋",
+    )
 
-    Returns
-    -------
-    dict
-        {
-            "chart_status": str,
-            "is_swing_candidate": bool,  # 스윙 진입 후보 여부
-            "signal": str,               # "매수검토" | "관망" | "매도검토"
-            "swing_setup": str,          # 스윙 셋업 유형
-            "indicators": dict,
-            "note": str,
-        }
-    """
-    if df is None or df.empty:
-        return _empty_result("데이터 없음")
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        sector = st.selectbox(
+            "섹터 필터",
+            ["전체", "Technology", "Energy", "Healthcare", "Financials",
+             "Consumer Discretionary", "Industrials", "Materials"],
+            key="us_sector",
+        )
+    with col2:
+        sentiment_min = st.slider("감성점수 최소", 0, 100, 70, key="us_sentiment")
+    with col3:
+        run = st.button("🔍 지금 스크리닝", type="primary", key="us_run", use_container_width=True)
 
-    df = df.copy().sort_values("date").reset_index(drop=True)
+    st.divider()
 
-    try:
-        indicators = _calc_indicators(df)
-        signal, status, setup = _judge_signal(indicators)
-
-        return {
-            "chart_status":       status,
-            "is_swing_candidate": signal == "매수검토",
-            "signal":             signal,
-            "swing_setup":        setup,
-            "indicators":         indicators,
-            "note":               "technical_us.py — 교체 전 기본 버전",
-        }
-
-    except Exception as e:
-        return _empty_result(f"분석 오류: {e}")
-
-
-# ── 지표 계산 ───────────────────────────────────────────────
-def _calc_indicators(df: pd.DataFrame) -> dict:
-    close  = df["close"]
-    volume = df["volume"]
-
-    # 이동평균
-    ma10 = close.rolling(10).mean()
-    ma50 = close.rolling(50).mean()
-
-    # RSI (14일)
-    rsi = _calc_rsi(close, 14)
-
-    # 52주 고점 대비
-    high_252 = df["high"].rolling(min(252, len(df))).max().iloc[-1]
-    current  = close.iloc[-1]
-    from_high_pct = (current - high_252) / high_252 * 100
-
-    # 거래량 비율
-    vol_ratio = volume.rolling(5).mean().iloc[-1] / volume.rolling(20).mean().iloc[-1]
-
-    # 모멘텀 (20일 수익률)
-    momentum_20d = (current / close.iloc[-21] - 1) * 100 if len(close) > 21 else 0
-
-    return {
-        "current_price":  current,
-        "ma10":           ma10.iloc[-1],
-        "ma50":           ma50.iloc[-1],
-        "above_ma10":     current > ma10.iloc[-1],
-        "above_ma50":     current > ma50.iloc[-1],
-        "rsi":            round(rsi, 1),
-        "from_high_pct":  round(from_high_pct, 2),
-        "near_52w_high":  from_high_pct >= -8,    # 52주 고점 8% 이내
-        "vol_ratio":      round(vol_ratio, 2),
-        "momentum_20d":   round(momentum_20d, 2), # % 단위
-    }
-
-
-def _calc_rsi(close: pd.Series, period: int = 14) -> float:
-    delta  = close.diff()
-    gain   = delta.clip(lower=0).rolling(period).mean()
-    loss   = (-delta.clip(upper=0)).rolling(period).mean()
-    rs     = gain / loss
-    rsi    = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1]) if not rsi.empty else 50.0
-
-
-def _judge_signal(ind: dict) -> tuple[str, str, str]:
-    """
-    스윙 신호 판단.
-    ★ 추후 세밀한 스윙 매매 기준으로 이 함수를 교체하면 됩니다.
-    """
-    above_ma10  = ind.get("above_ma10", False)
-    above_ma50  = ind.get("above_ma50", False)
-    rsi         = ind.get("rsi", 50)
-    near_high   = ind.get("near_52w_high", False)
-    momentum    = ind.get("momentum_20d", 0)
-    vol_ratio   = ind.get("vol_ratio", 1.0)
-
-    # RSI 과매수 영역 제외 (70 이상)
-    rsi_ok = 40 <= rsi <= 70
-
-    if above_ma10 and above_ma50 and rsi_ok and near_high and momentum > 5:
-        signal = "매수검토"
-        setup  = "52주 신고가 돌파 모멘텀"
-        status = f"MA10·MA50 위 · RSI {rsi} · 52주 고점 근접 · 20일 수익률 {momentum:.1f}%"
-    elif above_ma10 and rsi_ok and vol_ratio >= 1.2:
-        signal = "관망"
-        setup  = "MA 정배열 확인 중"
-        status = f"MA10 위 · RSI {rsi} · 추가 조건 확인 필요"
+    if run:
+        with st.spinner("데이터 수집 및 AI 분석 중..."):
+            try:
+                from modules.screener_us import run_screening
+                results = run_screening(sector=sector, sentiment_min=sentiment_min)
+                _render_results(results)
+            except ImportError:
+                st.warning("screener_us 모듈 준비 중입니다. Phase 2에서 연동됩니다.")
+                _render_placeholder()
     else:
-        signal = "관망"
-        setup  = "진입 조건 미충족"
-        status = f"MA 미정배열 또는 RSI 부적합 ({rsi})"
-
-    return signal, status, setup
+        st.caption("조건을 설정하고 '지금 스크리닝' 버튼을 누르세요.")
 
 
-def _empty_result(reason: str) -> dict:
-    return {
-        "chart_status":       reason,
-        "is_swing_candidate": False,
-        "signal":             "관망",
-        "swing_setup":        "—",
-        "indicators":         {},
-        "note":               reason,
-    }
+def _render_results(results: list[dict]):
+    if not results:
+        st.warning("현재 조건에 맞는 종목이 없습니다.")
+        return
+
+    st.success(f"조건 충족 종목 {len(results)}개")
+
+    for i, r in enumerate(results, 1):
+        with st.expander(
+            f"**{i}. {r.get('name','—')} ({r.get('ticker','—')})** — AI 점수 {r.get('score',0)}점",
+            expanded=(i == 1),
+        ):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("현재가", r.get("price", "—"))
+            c2.metric("52주 고점 대비", r.get("from_high", "—"))
+            c3.metric("뉴스 감성점수", r.get("sentiment", "—"))
+            c4.metric("섹터", r.get("sector", "—"))
+
+            st.markdown(f"**모멘텀 근거**: {r.get('momentum_reason', '—')}")
+            st.markdown(f"**실적 현황**: {r.get('earnings_status', '—')}")
+
+            col_a, col_b, col_c = st.columns(3)
+            col_a.markdown(f"**목표가**: {r.get('target_price', '—')}")
+            col_b.markdown(f"**손절가**: {r.get('stop_loss', '—')}")
+            col_c.markdown(f"**손익비**: {r.get('risk_reward', '—')}")
+
+            if r.get("risk"):
+                st.error(f"⚠️ 리스크: {r['risk']}")
+
+            st.caption("_AI 분석은 참고용입니다. 최종 매매 판단은 직접 하세요._")
+
+
+def _render_placeholder():
+    sample = [
+        {"name": "Sample Corp", "ticker": "SMPL", "score": 82,
+         "price": "$245.30", "from_high": "-3.2%", "sentiment": 76, "sector": "Technology",
+         "momentum_reason": "52주 신고가 근접, RSI 62로 과열 아님",
+         "earnings_status": "최근 분기 EPS 예상 +12% 상회",
+         "target_price": "$270", "stop_loss": "$228", "risk_reward": "1:2.1",
+         "risk": "고PER 밸류에이션 부담, 달러 강세 리스크"},
+    ]
+    _render_results(sample)
