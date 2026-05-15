@@ -143,8 +143,9 @@ def run_screening(top_n: int = 100, sentiment_min: int = 65) -> list[dict]:
 
 # ── 거래대금 상위 종목 ────────────────────────────────────
 def _get_volume_leaders(top_n: int) -> list[dict]:
-    """KIS 거래대금 순위 조회."""
+    """KIS 거래량순위 조회 — 최대 30건."""
     url = f"{KIS_BASE}/uapi/domestic-stock/v1/ranking/volume"
+    top_n = min(top_n, 30)  # KIS API 최대 30건 제한
     params = {
         "fid_cond_mrkt_div_code": "J",
         "fid_cond_scr_div_code":  "20171",
