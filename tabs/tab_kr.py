@@ -1,11 +1,12 @@
 """
 tabs/tab_kr.py
 국내(KRX) 단기 트레이딩 스크리닝 탭.
-실제 스크리닝 로직은 modules/screener_kr.py 에 있다.
-기술적 분석 로직은 modules/technical_kr.py 에 분리 — 수정 시 이 파일 무관.
+수급 데이터: 요약 텍스트 + 클릭 시 외국인·기관·개인 차트
 """
 
 import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
 
 
 def render():
@@ -31,14 +32,12 @@ def render():
     st.divider()
 
     if run:
-        with st.spinner("데이터 수집 및 AI 분석 중..."):
-            try:
-                from modules.screener_kr import run_screening
-                results = run_screening(top_n=top_n, sentiment_min=sentiment_min)
-                _render_results(results)
-            except ImportError:
-                st.warning("screener_kr 모듈 준비 중입니다. Phase 2에서 연동됩니다.")
-                _render_placeholder()
+        try:
+            from modules.screener_kr import run_screening
+            results = run_screening(top_n=top_n, sentiment_min=sentiment_min)
+            _render_results(results)
+        except ImportError as e:
+            st.error(f"모듈 로드 오류: {e}")
     else:
         st.caption("조건을 설정하고 '지금 스크리닝' 버튼을 누르세요.")
 
@@ -48,21 +47,44 @@ def _render_results(results: list[dict]):
         st.warning("현재 조건에 맞는 종목이 없습니다.")
         return
 
-    st.success(f"조건 충족 종목 {len(results)}개")
+    st.success(f"✅ 조건 충족 종목 {len(results)}개")
 
     for i, r in enumerate(results, 1):
         with st.expander(
-            f"**{i}. {r.get('name','—')} ({r.get('ticker','—')})** — AI 점수 {r.get('score',0)}점",
+            f"**{i}. {r.get('name','—')} ({r.get('ticker','—')})** "
+            f"— AI 점수 {r.get('score',0)}점 | {r.get('signal','—')}",
             expanded=(i == 1),
         ):
-            c1, c2, c3 = st.columns(3)
-            c1.metric("거래대금 증가율", r.get("volume_ratio", "—"))
-            c2.metric("뉴스 감성점수", r.get("sentiment", "—"))
-            c3.metric("현재가", r.get("price", "—"))
+            # ── 기본 지표 ──
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("현재가",      r.get("price", "—"))
+            c2.metric("거래대금",    r.get("trade_value", "—"))
+            c3.metric("뉴스 감성점수", r.get("sentiment", "—"))
+            c4.metric("거래량 증가율", r.get("volume_ratio", "—"))
 
             st.markdown(f"**테마·재료**: {r.get('theme', '—')}")
             st.markdown(f"**차트 상태**: {r.get('chart_status', '—')}")
 
+            # ── 수급 요약 ──
+            supply = r.get("supply", {})
+            if supply:
+                st.markdown("**수급 (당일 순매수)**")
+                s1, s2, s3 = st.columns(3)
+                foreign = supply.get("외국인", 0)
+                inst    = supply.get("기관", 0)
+                retail  = supply.get("개인", 0)
+                s1.metric("외국인", f"{foreign:+,}억",
+                          delta_color="normal" if foreign >= 0 else "inverse")
+                s2.metric("기관",   f"{inst:+,}억",
+                          delta_color="normal" if inst >= 0 else "inverse")
+                s3.metric("개인",   f"{retail:+,}억",
+                          delta_color="normal" if retail >= 0 else "inverse")
+
+            # ── 수급 차트 (20일) ──
+            with st.expander("📊 수급 차트 (최근 20일)", expanded=False):
+                _render_supply_chart(r.get("ticker", ""), r.get("name", ""))
+
+            # ── 리스크·손익 ──
             if r.get("risk"):
                 st.error(f"⚠️ 리스크: {r['risk']}")
 
@@ -70,15 +92,52 @@ def _render_results(results: list[dict]):
             col_a.markdown(f"**목표가**: {r.get('target_price', '—')}")
             col_b.markdown(f"**손절가**: {r.get('stop_loss', '—')}")
 
+            # ── 관련 뉴스 ──
+            news = r.get("news", [])
+            if news:
+                with st.expander("📰 관련 뉴스", expanded=False):
+                    for n in news[:5]:
+                        st.caption(f"• {n}")
+
             st.caption("_AI 분석은 참고용입니다. 최종 매매 판단은 직접 하세요._")
 
 
-def _render_placeholder():
-    """스크리닝 모듈 연동 전 UI 구조 확인용 플레이스홀더."""
-    sample = [
-        {"name": "샘플종목A", "ticker": "000000", "score": 78,
-         "volume_ratio": "+42%", "sentiment": 74, "price": "12,500원",
-         "theme": "AI반도체", "chart_status": "5일선 위, 전고점 돌파 중",
-         "risk": "단기 과열 가능성", "target_price": "14,000원", "stop_loss": "11,500원"},
-    ]
-    _render_results(sample)
+def _render_supply_chart(ticker: str, name: str):
+    """외국인·기관·개인 순매수 금액 막대 차트."""
+    if not ticker:
+        st.caption("티커 정보 없음")
+        return
+
+    try:
+        from modules.screener_kr import get_supply_detail
+        df = get_supply_detail(ticker, days=20)
+
+        if df.empty:
+            st.caption("수급 데이터를 가져올 수 없습니다.")
+            return
+
+        fig = go.Figure()
+
+        colors = {"외국인": "#1f77b4", "기관": "#ff7f0e", "개인": "#2ca02c"}
+        for col in ["외국인", "기관", "개인"]:
+            if col in df.columns:
+                fig.add_trace(go.Bar(
+                    name=col,
+                    x=df["date"].astype(str),
+                    y=df[col] / 1e8,  # 억 단위
+                    marker_color=colors.get(col, "gray"),
+                ))
+
+        fig.update_layout(
+            title=f"{name} 수급 (억원)",
+            barmode="group",
+            height=300,
+            margin=dict(l=20, r=20, t=40, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            yaxis_title="순매수 (억원)",
+            xaxis_tickangle=-45,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.caption(f"차트 로드 오류: {e}")
