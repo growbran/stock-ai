@@ -143,13 +143,13 @@ def run_screening(top_n: int = 100, sentiment_min: int = 65) -> list[dict]:
 
 # ── 거래대금 상위 종목 ────────────────────────────────────
 def _get_volume_leaders(top_n: int) -> list[dict]:
-    """KIS 거래량 순위 조회 (FHPST01710000)."""
+    """KIS 거래대금 순위 조회."""
     url = f"{KIS_BASE}/uapi/domestic-stock/v1/ranking/volume"
     params = {
-        "fid_cond_mrkt_div_code": "J",       # 주식
+        "fid_cond_mrkt_div_code": "J",
         "fid_cond_scr_div_code":  "20171",
-        "fid_input_iscd":         "0000",     # 전체
-        "fid_rank_sort_cls_code": "0",        # 거래대금 순
+        "fid_input_iscd":         "0000",
+        "fid_rank_sort_cls_code": "0",
         "fid_input_cnt_1":        str(top_n),
         "fid_trgt_cls_code":      "0",
         "fid_trgt_exls_cls_code": "000000",
