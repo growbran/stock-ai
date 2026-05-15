@@ -291,24 +291,37 @@ def _get_investor_supply(ticker: str) -> dict | None:
 
 
 def get_supply_detail(ticker: str, days: int = 20) -> pd.DataFrame:
-    """수급 차트용 날짜별 데이터."""
+    """수급 차트용 날짜별 데이터 — KIS API 기반."""
     try:
-        from pykrx import stock as krx
+        url = f"{KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         today = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
-        df = krx.get_market_trading_value_by_date(start, today, ticker)
-        if df is None or df.empty:
+        params = {
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd":         ticker,
+            "fid_input_date_1":       start,
+            "fid_input_date_2":       today,
+            "fid_period_div_code":    "D",
+            "fid_org_adj_prc":        "0",
+        }
+        resp = requests.get(
+            url, headers=_kis_headers("FHKST03010100"), params=params, timeout=10
+        )
+        output = resp.json().get("output2", [])
+        if not output:
             return pd.DataFrame()
-        df = df.reset_index()
-        col_map = {}
-        for c in df.columns:
-            if "외국인" in c:                         col_map[c] = "외국인"
-            elif "기관" in c:                         col_map[c] = "기관"
-            elif "개인" in c:                         col_map[c] = "개인"
-            elif "날짜" in c or "date" in c.lower():  col_map[c] = "date"
-        df = df.rename(columns=col_map)
-        keep = [c for c in ["date", "외국인", "기관", "개인"] if c in df.columns]
-        return df[keep].tail(days)
+
+        rows = []
+        for item in output:
+            rows.append({
+                "date":   item.get("stck_bsop_date", ""),
+                "외국인": int(item.get("frgn_ntby_qty", 0)),
+                "기관":   int(item.get("orgn_ntby_qty", 0)),
+                "개인":   int(item.get("indv_ntby_qty", 0)),
+            })
+        df = pd.DataFrame(rows).sort_values("date").tail(days)
+        return df.reset_index(drop=True)
+
     except Exception:
         return pd.DataFrame()
 
