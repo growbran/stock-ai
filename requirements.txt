@@ -4,21 +4,25 @@
 streamlit>=1.35.0
 
 # AI
-google-genai>=0.8.0          # genai.Client() 방식 고정
+google-genai>=0.8.0
 
 # DB
 supabase>=2.4.0
 
-# 주가 데이터
-yfinance>=0.2.40
-alpaca-py>=0.20.0            # Alpaca Markets
+# 국내 주식 데이터
+pykrx>=1.0.45
 
-# 기술적 분석 (모듈 분리 — technical_kr.py / technical_us.py 에서만 사용)
+# 미국 주식 데이터
+yfinance>=0.2.40
+alpaca-py>=0.20.0
+
+# 데이터 처리
 pandas>=2.0.0
 numpy>=1.26.0
 
 # 차트
 plotly>=5.20.0
 
-# 뉴스·HTTP
+# 뉴스 크롤링
 requests>=2.31.0
+beautifulsoup4>=4.12.0
