@@ -1,173 +1,311 @@
 """
 modules/screener_kr.py
-국내(KRX) 단기 트레이딩 종목 스크리닝.
+국내(KRX) 단기 트레이딩 종목 스크리닝 — KIS API 기반
 
-데이터 소스:
-- pykrx : 주가·거래대금·수급(외국인·기관·개인)
-- Naver 금융 크롤링 : 뉴스
-- Gemini API : 뉴스 감성 분석
-
-선정 조건 (우선순위):
-1. 거래대금 급증 — 당일 상위 top_n 이내
-2. 재료·테마 존재 — 뉴스 감성점수 sentiment_min 이상
-3. 차트 우상향 — 5일선 위, 전고점 근접
+조건 (우선순위):
+1. 시가총액 1,000억 이상 + 주가 1,000원 이상 + 양봉
+2. 전일 대비 7% 이상 상승 + 거래대금 3,000억 이상 or 상위 100위
+3. 20일 이동평균선 우상향 + 현재가 20일선 위
+4. 외국인 순매수 > 0 AND 기관 순매수 > 0 (양매수 필수)
 """
 
 from __future__ import annotations
-import pandas as pd
 import requests
-from datetime import datetime, timedelta
+import pandas as pd
 import streamlit as st
+from datetime import datetime, timedelta
 
-try:
-    from pykrx import stock as krx
-except ImportError:
-    krx = None
-
-
-# ── 메인 스크리닝 함수 ────────────────────────────────────
-def run_screening(top_n: int = 30, sentiment_min: int = 65) -> list[dict]:
-    """
-    당일 기준 거래대금 상위 종목 중 조건 충족 종목 반환.
-    Returns: list of dict (UI 렌더링용)
-    """
-    if krx is None:
-        st.error("pykrx 패키지가 필요합니다. requirements.txt에 pykrx 추가 후 재배포하세요.")
-        return []
-
-    today = _get_trading_date()
-
-    with st.spinner("거래대금 상위 종목 조회 중..."):
-        volume_df = _get_top_volume(today, top_n)
-
-    if volume_df.empty:
-        st.warning("거래대금 데이터를 가져오지 못했습니다.")
-        return []
-
-    results = []
-    progress = st.progress(0, text="종목 분석 중...")
-
-    for i, row in volume_df.iterrows():
-        ticker = row["ticker"]
-        name   = row["name"]
-        progress.progress((list(volume_df.index).index(i) + 1) / len(volume_df),
-                          text=f"분석 중: {name} ({ticker})")
-
-        # 주가 데이터
-        price_df = _get_price_data(ticker, today)
-        if price_df is None or len(price_df) < 6:
-            continue
-
-        # 기술적 분석
-        try:
-            from modules.technical_kr import run_technical_analysis
-            tech = run_technical_analysis(price_df)
-        except Exception:
-            tech = {"is_uptrend": False, "chart_status": "분석 불가", "signal": "관망"}
-
-        if not tech.get("is_uptrend", False):
-            continue
-
-        # 수급 데이터
-        supply = _get_supply_data(ticker, today)
-
-        # 뉴스 감성
-        sentiment_score, news_list = _get_news_sentiment(name)
-        if sentiment_score < sentiment_min:
-            continue
-
-        # 목표가·손절가 계산
-        current = price_df["close"].iloc[-1]
-        target  = round(current * 1.08, -1)
-        stop    = round(current * 0.96, -1)
-
-        results.append({
-            "ticker":        ticker,
-            "name":          name,
-            "score":         _calc_score(tech, sentiment_score, supply),
-            "price":         f"{int(current):,}원",
-            "volume_ratio":  row.get("volume_ratio", "—"),
-            "trade_value":   row.get("trade_value", "—"),
-            "sentiment":     sentiment_score,
-            "theme":         _extract_theme(news_list),
-            "chart_status":  tech.get("chart_status", "—"),
-            "signal":        tech.get("signal", "관망"),
-            "risk":          _build_risk(tech, supply),
-            "target_price":  f"{int(target):,}원",
-            "stop_loss":     f"{int(stop):,}원",
-            "supply":        supply,      # 수급 raw 데이터 (차트용)
-            "news":          news_list,
-        })
-
-    progress.empty()
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:5]  # TOP 5만 반환
+# ── KIS API 설정 ──────────────────────────────────────────
+KIS_BASE = "https://openapi.koreainvestment.com:9443"
 
 
-# ── 거래대금 상위 조회 ────────────────────────────────────
-def _get_top_volume(date: str, top_n: int) -> pd.DataFrame:
+def _get_kis_token() -> str:
+    """KIS 접근토큰 발급 (세션에 캐싱)."""
+    if "kis_token" in st.session_state:
+        return st.session_state["kis_token"]
+
+    url = f"{KIS_BASE}/oauth2/tokenP"
+    body = {
+        "grant_type":   "client_credentials",
+        "appkey":       st.secrets["KIS_APP_KEY"],
+        "appsecret":    st.secrets["KIS_APP_SECRET"],
+    }
+    resp = requests.post(url, json=body, timeout=10)
+    resp.raise_for_status()
+    token = resp.json()["access_token"]
+    st.session_state["kis_token"] = token
+    return token
+
+
+def _kis_headers(tr_id: str) -> dict:
+    return {
+        "content-type":  "application/json; charset=utf-8",
+        "authorization": f"Bearer {_get_kis_token()}",
+        "appkey":        st.secrets["KIS_APP_KEY"],
+        "appsecret":     st.secrets["KIS_APP_SECRET"],
+        "tr_id":         tr_id,
+        "custtype":      "P",
+    }
+
+
+# ── 메인 스크리닝 ─────────────────────────────────────────
+def run_screening(top_n: int = 100, sentiment_min: int = 65) -> list[dict]:
     try:
-        df = krx.get_market_trading_value_by_ticker(date, market="KOSPI")
-        df2 = krx.get_market_trading_value_by_ticker(date, market="KOSDAQ")
-        df = pd.concat([df, df2])
+        with st.spinner("거래대금 상위 종목 조회 중..."):
+            candidates = _get_volume_leaders(top_n)
 
-        # 거래대금 컬럼명 확인 후 정렬
-        val_col = [c for c in df.columns if "거래대금" in c or "거래" in c]
-        if not val_col:
-            return pd.DataFrame()
+        if not candidates:
+            st.warning("거래대금 상위 종목을 가져오지 못했습니다.")
+            return []
 
-        df = df.sort_values(val_col[0], ascending=False).head(top_n).reset_index()
-        df.columns = [c if c != "티커" else "ticker" for c in df.columns]
+        results = []
+        progress = st.progress(0, text="조건 필터링 중...")
+        total = len(candidates)
 
-        # 종목명 추가
-        name_map = krx.get_market_ticker_name(date)
-        df["name"]  = df["ticker"].map(name_map).fillna("—")
+        for idx, item in enumerate(candidates):
+            ticker = item["ticker"]
+            name   = item["name"]
+            progress.progress((idx + 1) / total, text=f"분석 중: {name}")
 
-        # 거래량 비율 (5일 평균 대비)
-        df["trade_value"]  = df[val_col[0]].apply(lambda x: f"{x/1e8:.0f}억")
-        df["volume_ratio"] = "—"
+            # 1. 기본 필터 (시총·주가·양봉·상승률)
+            detail = _get_stock_detail(ticker)
+            if detail is None:
+                continue
+            if not _pass_basic_filter(detail):
+                continue
 
-        return df[["ticker", "name", "trade_value", "volume_ratio"]]
+            # 2. 이동평균 필터 (20일선)
+            price_df = _get_ohlcv(ticker)
+            if price_df is None or len(price_df) < 21:
+                continue
+            if not _pass_ma_filter(price_df, detail["current"]):
+                continue
+
+            # 3. 외인·기관 양매수 필터
+            supply = _get_investor_supply(ticker)
+            if supply is None:
+                continue
+            if not (supply["외국인"] > 0 and supply["기관"] > 0):
+                continue
+
+            # 뉴스 감성
+            sentiment_score, news_list = _get_news_sentiment(name)
+
+            current = detail["current"]
+            target  = round(current * 1.08, -1)
+            stop    = round(current * 0.96, -1)
+
+            results.append({
+                "ticker":       ticker,
+                "name":         name,
+                "score":        _calc_score(detail, supply, sentiment_score),
+                "price":        f"{int(current):,}원",
+                "change_rate":  detail.get("change_rate", "—"),
+                "trade_value":  item.get("trade_value", "—"),
+                "sentiment":    sentiment_score,
+                "theme":        _extract_theme(news_list),
+                "chart_status": _chart_status(price_df, detail["current"]),
+                "signal":       "매수검토",
+                "risk":         _build_risk(detail, supply),
+                "target_price": f"{int(target):,}원",
+                "stop_loss":    f"{int(stop):,}원",
+                "supply":       supply,
+                "news":         news_list,
+            })
+
+        progress.empty()
+
+        # Supabase 저장
+        if results:
+            _save_to_supabase(results)
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:5]
 
     except Exception as e:
-        st.warning(f"거래대금 조회 오류: {e}")
-        return pd.DataFrame()
+        st.error(f"스크리닝 오류: {e}")
+        return []
 
 
-# ── 주가 OHLCV ────────────────────────────────────────────
-def _get_price_data(ticker: str, date: str) -> pd.DataFrame | None:
+# ── 거래대금 상위 종목 ────────────────────────────────────
+def _get_volume_leaders(top_n: int) -> list[dict]:
+    """KIS 거래량 순위 조회 (FHPST01710000)."""
+    url = f"{KIS_BASE}/uapi/domestic-stock/v1/ranking/volume"
+    params = {
+        "fid_cond_mrkt_div_code": "J",       # 주식
+        "fid_cond_scr_div_code":  "20171",
+        "fid_input_iscd":         "0000",     # 전체
+        "fid_rank_sort_cls_code": "0",        # 거래대금 순
+        "fid_input_cnt_1":        str(top_n),
+        "fid_trgt_cls_code":      "111111111",
+        "fid_trgt_exls_cls_code": "000000",
+        "fid_div_cls_code":       "0",
+        "fid_rsfl_rate1":         "",
+        "fid_rsfl_rate2":         "",
+    }
     try:
-        start = (datetime.strptime(date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
-        df = krx.get_market_ohlcv(start, date, ticker)
-        if df.empty:
-            return None
-        df = df.reset_index()
-        df.columns = ["date", "open", "high", "low", "close", "volume"]
-        return df
+        resp = requests.get(
+            url, headers=_kis_headers("FHPST01710000"), params=params, timeout=10
+        )
+        data = resp.json()
+        results = []
+        for item in data.get("output", []):
+            trade_val = int(item.get("acml_tr_pbmn", 0))
+            if trade_val < 300_000_000_000:  # 3,000억 미만 제외
+                continue
+            results.append({
+                "ticker":      item.get("mksc_shrn_iscd", ""),
+                "name":        item.get("hts_kor_isnm", ""),
+                "trade_value": f"{trade_val/1e8:.0f}억",
+            })
+        return results
+    except Exception as e:
+        st.warning(f"거래량 순위 조회 오류: {e}")
+        return []
+
+
+# ── 종목 상세 (현재가·시총·등락률·양봉) ──────────────────
+def _get_stock_detail(ticker: str) -> dict | None:
+    url = f"{KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-price"
+    params = {
+        "fid_cond_mrkt_div_code": "J",
+        "fid_input_iscd": ticker,
+    }
+    try:
+        resp = requests.get(
+            url, headers=_kis_headers("FHKST01010100"), params=params, timeout=10
+        )
+        d = resp.json().get("output", {})
+        current    = int(d.get("stck_prpr", 0))
+        open_price = int(d.get("stck_oprc", 0))
+        mkt_cap    = int(d.get("hts_avls", 0))         # 억원
+        change_rt  = float(d.get("prdy_ctrt", 0))      # 등락률 %
+
+        return {
+            "current":     current,
+            "open":        open_price,
+            "mkt_cap":     mkt_cap,
+            "change_rate": f"{change_rt:+.2f}%",
+            "change_pct":  change_rt,
+            "is_bullish":  current > open_price,        # 양봉
+        }
     except Exception:
         return None
 
 
-# ── 수급 데이터 (외국인·기관·개인) ───────────────────────
-def get_supply_detail(ticker: str, days: int = 20) -> pd.DataFrame:
-    """
-    외국인·기관·개인 순매수 금액 반환.
-    tab_kr.py 에서 차트 렌더링에 직접 사용.
-    """
+def _pass_basic_filter(d: dict) -> bool:
+    """시총 1,000억↑ + 주가 1,000원↑ + 양봉 + 7%↑."""
+    return (
+        d["mkt_cap"] >= 1000 and
+        d["current"] >= 1000 and
+        d["is_bullish"] and
+        d["change_pct"] >= 7.0
+    )
+
+
+# ── OHLCV (일봉) ─────────────────────────────────────────
+def _get_ohlcv(ticker: str, count: int = 30) -> pd.DataFrame | None:
+    url = f"{KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    today = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+    params = {
+        "fid_cond_mrkt_div_code": "J",
+        "fid_input_iscd":         ticker,
+        "fid_input_date_1":       start,
+        "fid_input_date_2":       today,
+        "fid_period_div_code":    "D",
+        "fid_org_adj_prc":        "0",
+    }
     try:
-        today = _get_trading_date()
-        start = (datetime.strptime(today, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
+        resp = requests.get(
+            url, headers=_kis_headers("FHKST03010100"), params=params, timeout=10
+        )
+        output = resp.json().get("output2", [])
+        if not output:
+            return None
+        df = pd.DataFrame(output)
+        df = df.rename(columns={
+            "stck_bsop_date": "date",
+            "stck_oprc":      "open",
+            "stck_hgpr":      "high",
+            "stck_lwpr":      "low",
+            "stck_clpr":      "close",
+            "acml_vol":       "volume",
+        })
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.sort_values("date").reset_index(drop=True)
+    except Exception:
+        return None
+
+
+def _pass_ma_filter(df: pd.DataFrame, current: float) -> bool:
+    """20일선 우상향 + 현재가 20일선 위."""
+    ma20 = df["close"].rolling(20).mean()
+    if ma20.iloc[-1] is None or pd.isna(ma20.iloc[-1]):
+        return False
+    uptrend = ma20.iloc[-1] > ma20.iloc[-5]   # 5일 전보다 올라야 우상향
+    above   = current > ma20.iloc[-1]
+    return uptrend and above
+
+
+def _chart_status(df: pd.DataFrame, current: float) -> str:
+    ma20 = df["close"].rolling(20).mean().iloc[-1]
+    ma5  = df["close"].rolling(5).mean().iloc[-1]
+    parts = []
+    if current > ma5:  parts.append("5일선 위")
+    if current > ma20: parts.append("20일선 위")
+    high_52w = df["high"].max()
+    from_high = (current - high_52w) / high_52w * 100
+    if from_high >= -5: parts.append("전고점 근접")
+    return " · ".join(parts) if parts else "추세 확인 필요"
+
+
+# ── 외인·기관 수급 ────────────────────────────────────────
+def _get_investor_supply(ticker: str) -> dict | None:
+    """당일 투자자별 순매수 금액 조회."""
+    url = f"{KIS_BASE}/uapi/domestic-stock/v1/trading/inquire-investor"
+    params = {
+        "fid_cond_mrkt_div_code": "J",
+        "fid_input_iscd":         ticker,
+    }
+    try:
+        resp = requests.get(
+            url, headers=_kis_headers("FHKST01010900"), params=params, timeout=10
+        )
+        output = resp.json().get("output", [])
+        if not output:
+            return None
+
+        result = {"외국인": 0, "기관": 0, "개인": 0}
+        for item in output:
+            investor = item.get("invst_nm", "")
+            net = int(item.get("srtn_seln_qty", 0)) - int(item.get("srtn_shnu_qty", 0))
+            if "외국인" in investor: result["외국인"] += net
+            elif "기관" in investor: result["기관"]   += net
+            elif "개인" in investor: result["개인"]   += net
+        return result
+    except Exception:
+        return None
+
+
+def get_supply_detail(ticker: str, days: int = 20) -> pd.DataFrame:
+    """수급 차트용 날짜별 데이터."""
+    try:
+        from pykrx import stock as krx
+        today = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
         df = krx.get_market_trading_value_by_date(start, today, ticker)
-        if df.empty:
+        if df is None or df.empty:
             return pd.DataFrame()
         df = df.reset_index()
-        # 컬럼명 정리
         col_map = {}
         for c in df.columns:
-            if "외국인" in c: col_map[c] = "외국인"
-            elif "기관" in c:  col_map[c] = "기관"
-            elif "개인" in c:  col_map[c] = "개인"
-            elif "날짜" in c or "date" in c.lower(): col_map[c] = "date"
+            if "외국인" in c:                         col_map[c] = "외국인"
+            elif "기관" in c:                         col_map[c] = "기관"
+            elif "개인" in c:                         col_map[c] = "개인"
+            elif "날짜" in c or "date" in c.lower():  col_map[c] = "date"
         df = df.rename(columns=col_map)
         keep = [c for c in ["date", "외국인", "기관", "개인"] if c in df.columns]
         return df[keep].tail(days)
@@ -175,68 +313,58 @@ def get_supply_detail(ticker: str, days: int = 20) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _get_supply_data(ticker: str, date: str) -> dict:
-    """스크리닝용 수급 요약."""
-    try:
-        start = (datetime.strptime(date, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d")
-        df = krx.get_market_trading_value_by_date(start, date, ticker)
-        if df.empty:
-            return {}
-        last = df.iloc[-1]
-        result = {}
-        for c in df.columns:
-            if "외국인" in c: result["외국인"] = int(last[c] / 1e8)
-            elif "기관" in c:  result["기관"]   = int(last[c] / 1e8)
-            elif "개인" in c:  result["개인"]   = int(last[c] / 1e8)
-        return result
-    except Exception:
-        return {}
-
-
-# ── 뉴스 감성 분석 ───────────────────────────────────────
+# ── 뉴스 감성 ────────────────────────────────────────────
 def _get_news_sentiment(name: str) -> tuple[int, list[str]]:
-    """Naver 뉴스 크롤링 + Gemini 감성 분석."""
     news_list = _fetch_naver_news(name)
     if not news_list:
         return 50, []
-
     try:
         from utils.clients import get_gemini
         client = get_gemini()
-        prompt = f"""다음은 '{name}' 종목 관련 최신 뉴스 제목들입니다.
-투자 관점에서 긍정/부정을 종합해 0~100점으로 점수를 매겨주세요.
-숫자만 답하세요.
-
-뉴스:
-{chr(10).join(news_list[:5])}"""
-
+        prompt = (
+            f"'{name}' 종목 관련 뉴스 제목들을 투자 관점에서 0~100점으로 점수만 숫자로 답하세요.\n\n"
+            + "\n".join(news_list[:5])
+        )
         resp = client.models.generate_content(
             model="gemini-2.0-flash-exp",
             contents=[{"role": "user", "parts": [{"text": prompt}]}],
         )
         score = int("".join(filter(str.isdigit, resp.text[:5])))
-        score = max(0, min(100, score))
-        return score, news_list
-
+        return max(0, min(100, score)), news_list
     except Exception:
         return 50, news_list
 
 
 def _fetch_naver_news(name: str) -> list[str]:
-    """Naver 금융 뉴스 제목 크롤링."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         url = f"https://search.naver.com/search.naver?where=news&query={name}+주식&sort=1"
         resp = requests.get(url, headers=headers, timeout=5)
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(resp.text, "html.parser")
-        titles = [a.get_text(strip=True) for a in soup.select(".news_tit")[:10]]
-        return titles
+        return [a.get_text(strip=True) for a in soup.select(".news_tit")[:10]]
     except Exception:
         return []
 
 
-# ── 테마 추출 ────────────────────────────────────────────
+# ── Supabase 저장 ─────────────────────────────────────────
+def _save_to_supabase(results: list[dict]):
+    try:
+        from utils.db import save_recommendation
+        from datetime import timezone
+        for r in results:
+            save_recommendation({
+                "ticker":         r["ticker"],
+                "market":         "KR",
+                "rec_type":       "주목",
+                "reason_summary": f"거래대금:{r['trade_value']} | 수급:{r['supply']} | 테마:{r['theme']}",
+                "rec_date":       datetime.now(timezone.utc).isoformat(),
+            })
+    except Exception:
+        pass
+
+
+# ── 유틸 ────────────────────────────────────────────────
 def _extract_theme(news_list: list[str]) -> str:
     keywords = ["AI", "반도체", "2차전지", "바이오", "전기차", "로봇", "방산", "수소", "태양광", "게임"]
     for kw in keywords:
@@ -246,38 +374,19 @@ def _extract_theme(news_list: list[str]) -> str:
     return "기타"
 
 
-# ── AI 종합 점수 ─────────────────────────────────────────
-def _calc_score(tech: dict, sentiment: int, supply: dict) -> int:
+def _calc_score(detail: dict, supply: dict, sentiment: int) -> int:
     score = 0
-    score += 40 if tech.get("is_uptrend") else 0
-    score += int(sentiment * 0.4)
-    foreign = supply.get("외국인", 0)
-    if foreign > 0:   score += 15
-    elif foreign < 0: score -= 5
+    score += min(30, int(detail.get("change_pct", 0) * 2))  # 등락률
+    score += 20 if supply.get("외국인", 0) > 0 else 0       # 외인 매수
+    score += 20 if supply.get("기관", 0) > 0 else 0         # 기관 매수
+    score += int(sentiment * 0.3)                            # 뉴스
     return min(100, max(0, score))
 
 
-# ── 리스크 문구 ──────────────────────────────────────────
-def _build_risk(tech: dict, supply: dict) -> str:
+def _build_risk(detail: dict, supply: dict) -> str:
     risks = []
-    ind = tech.get("indicators", {})
-    if ind.get("rsi", 50) > 70:
-        risks.append("RSI 과매수 구간")
-    if supply.get("외국인", 0) < -50:
-        risks.append("외국인 순매도")
-    if supply.get("기관", 0) < -50:
-        risks.append("기관 순매도")
-    if not risks:
-        risks.append("단기 변동성 주의")
+    if detail.get("change_pct", 0) >= 15:  risks.append("단기 급등 과열")
+    if supply.get("개인", 0) > 0 and supply.get("외국인", 0) < 0:
+        risks.append("개인 주도 상승 주의")
+    if not risks: risks.append("단기 변동성 주의")
     return " · ".join(risks)
-
-
-# ── 날짜 유틸 ────────────────────────────────────────────
-def _get_trading_date() -> str:
-    """오늘 또는 가장 최근 거래일 반환 (YYYYMMDD)."""
-    today = datetime.now()
-    if today.weekday() == 5:  # 토
-        today -= timedelta(days=1)
-    elif today.weekday() == 6:  # 일
-        today -= timedelta(days=2)
-    return today.strftime("%Y%m%d")
