@@ -19,20 +19,34 @@ from datetime import datetime, timedelta
 KIS_BASE = "https://openapi.koreainvestment.com:9443"
 
 
-def _get_kis_token() -> str:
-    """KIS 접근토큰 발급 (세션에 캐싱)."""
-    if "kis_token" in st.session_state:
+def _get_kis_token(force_refresh: bool = False) -> str:
+    """KIS 접근토큰 발급 (세션 캐싱 + 만료 시 자동 갱신)."""
+    if not force_refresh and "kis_token" in st.session_state:
         return st.session_state["kis_token"]
 
     url = f"{KIS_BASE}/oauth2/tokenP"
     body = {
-        "grant_type":   "client_credentials",
-        "appkey":       st.secrets["KIS_APP_KEY"],
-        "appsecret":    st.secrets["KIS_APP_SECRET"],
+        "grant_type": "client_credentials",
+        "appkey":     st.secrets["KIS_APP_KEY"],
+        "appsecret":  st.secrets["KIS_APP_SECRET"],
     }
     resp = requests.post(url, json=body, timeout=10)
-    resp.raise_for_status()
-    token = resp.json()["access_token"]
+
+    if resp.status_code != 200:
+        st.error(f"KIS 토큰 발급 실패: {resp.status_code} — {resp.text[:200]}")
+        raise Exception("KIS 토큰 발급 실패")
+
+    try:
+        data = resp.json()
+    except Exception:
+        st.error(f"KIS 토큰 응답 파싱 실패: {resp.text[:200]}")
+        raise
+
+    if "access_token" not in data:
+        st.error(f"KIS 토큰 응답 오류: {data}")
+        raise Exception("access_token 없음")
+
+    token = data["access_token"]
     st.session_state["kis_token"] = token
     return token
 
@@ -137,17 +151,41 @@ def _get_volume_leaders(top_n: int) -> list[dict]:
         "fid_input_iscd":         "0000",     # 전체
         "fid_rank_sort_cls_code": "0",        # 거래대금 순
         "fid_input_cnt_1":        str(top_n),
-        "fid_trgt_cls_code":      "111111111",
+        "fid_trgt_cls_code":      "0",
         "fid_trgt_exls_cls_code": "000000",
         "fid_div_cls_code":       "0",
-        "fid_rsfl_rate1":         "",
-        "fid_rsfl_rate2":         "",
+        "fid_rsfl_rate1":         "0",
+        "fid_rsfl_rate2":         "0",
     }
     try:
         resp = requests.get(
             url, headers=_kis_headers("FHPST01710000"), params=params, timeout=10
         )
-        data = resp.json()
+
+        if resp.status_code != 200:
+            st.error(f"KIS API 오류 ({resp.status_code}): {resp.text[:300]}")
+            return []
+
+        try:
+            data = resp.json()
+        except Exception:
+            st.error(f"KIS 응답 파싱 실패 (빈 응답 또는 HTML): {resp.text[:300]}")
+            return []
+
+        rt_cd = data.get("rt_cd", "")
+        if rt_cd != "0":
+            # 토큰 만료 시 자동 갱신 후 1회 재시도
+            if rt_cd == "1":
+                st.info("KIS 토큰 만료 — 자동 갱신 중...")
+                st.session_state.pop("kis_token", None)
+                resp2 = requests.get(
+                    url, headers=_kis_headers("FHPST01710000"), params=params, timeout=10
+                )
+                data = resp2.json()
+            else:
+                st.error(f"KIS API 응답 오류: {data.get('msg1', data)}")
+                return []
+
         results = []
         for item in data.get("output", []):
             trade_val = int(item.get("acml_tr_pbmn", 0))
@@ -159,6 +197,7 @@ def _get_volume_leaders(top_n: int) -> list[dict]:
                 "trade_value": f"{trade_val/1e8:.0f}억",
             })
         return results
+
     except Exception as e:
         st.warning(f"거래량 순위 조회 오류: {e}")
         return []
@@ -291,7 +330,7 @@ def _get_investor_supply(ticker: str) -> dict | None:
 
 
 def get_supply_detail(ticker: str, days: int = 20) -> pd.DataFrame:
-    """수급 차트용 날짜별 데이터 — KIS API 기반."""
+    """수급 차트용 날짜별 데이터 — KIS API 전용."""
     try:
         url = f"{KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         today = datetime.now().strftime("%Y%m%d")
@@ -307,6 +346,9 @@ def get_supply_detail(ticker: str, days: int = 20) -> pd.DataFrame:
         resp = requests.get(
             url, headers=_kis_headers("FHKST03010100"), params=params, timeout=10
         )
+        if resp.status_code != 200:
+            return pd.DataFrame()
+
         output = resp.json().get("output2", [])
         if not output:
             return pd.DataFrame()
