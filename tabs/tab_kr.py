@@ -23,7 +23,7 @@ def render():
 
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        top_n = st.selectbox("거래대금 상위", [30, 50, 100], index=0, key="kr_top_n")
+        top_n = st.selectbox("거래대금 상위", [10, 20, 30], index=2, key="kr_top_n")
     with col2:
         sentiment_min = st.slider("감성점수 최소", 0, 100, 65, key="kr_sentiment")
     with col3:
